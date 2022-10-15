@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+// Game state structures
 type State struct {
 	Player   Player
 	Exit     *Loc
@@ -20,6 +21,8 @@ type State struct {
 	Walls    map[int]map[int]bool // x:y:wall
 	SawEnemy time.Time
 	Enemy    *Loc
+	Ammo     []Item
+	Food     []Item
 }
 
 type Player struct {
@@ -35,111 +38,25 @@ type Loc struct {
 	Y int
 }
 
+type Item struct {
+	Loc  Loc
+	Seen time.Time
+}
+
+// Global variables
 var colorMap = map[string]string{"warrior": "red", "valkyrie": "blue", "elf": "green", "wizard": "yellow"}
 var GameState = State{
 	Floor: make(map[int]map[int]bool),
 	Walls: make(map[int]map[int]bool),
+	Ammo:  make([]Item, 0),
+	Food:  make([]Item, 0),
 }
-var floorMutex sync.Mutex
 var wallMutex sync.Mutex
-
-func setFloor(x int, y int) {
-	floorMutex.Lock()
-	defer floorMutex.Unlock()
-	_, ok := GameState.Floor[x]
-	if !ok {
-		GameState.Floor[x] = make(map[int]bool)
-	}
-	GameState.Floor[x][y] = true
-}
-
-func setWall(x int, y int) {
-	wallMutex.Lock()
-	defer wallMutex.Unlock()
-	_, ok := GameState.Walls[x]
-	if !ok {
-		GameState.Walls[x] = make(map[int]bool)
-	}
-	GameState.Walls[x][y] = true
-}
-
-func getWall(x int, y int) bool {
-	wallMutex.Lock()
-	defer wallMutex.Unlock()
-	_, ok := GameState.Walls[x]
-	if !ok {
-		return false
-	}
-	return GameState.Walls[x][y]
-}
-
-func intersects(playerLoc Loc, itemLoc Loc, wallX int, wallY int) bool {
-	a1 := itemLoc.Y - playerLoc.Y
-	b1 := playerLoc.X - itemLoc.X
-	c1 := a1*(playerLoc.X) + b1*playerLoc.Y
-
-	a2 := wallY - wallY
-	b2 := (wallX - 4) - (wallX + 4)
-	c2 := a2*(wallX-4) + b2*(wallY)
-
-	determinant := a1*b2 - a2*b1
-
-	if determinant != 0 {
-		x := (b2*c1 - b1*c2) / determinant
-		y := (a1*c2 - a2*c1) / determinant
-		// is the intersection point between us and the item?
-		if isBetweenPlayerAndItem(Loc{X: x, Y: y}, playerLoc, itemLoc) {
-			return true
-		}
-	}
-
-	a2 = (wallY - 4) - (wallY + 4)
-	b2 = wallX - wallX
-	c2 = a2*(wallX) + b2*(wallY-4)
-
-	determinant = a1*b2 - a2*b1
-
-	if determinant != 0 {
-		x := (b2*c1 - b1*c2) / determinant
-		y := (a1*c2 - a2*c1) / determinant
-		if isBetweenPlayerAndItem(Loc{X: x, Y: y}, playerLoc, itemLoc) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func isBetweenPlayerAndItem(point Loc, player Loc, item Loc) bool {
-	minX := math.Min(float64(player.X), float64(item.X))
-	maxX := math.Max(float64(player.X), float64(item.X))
-	minY := math.Min(float64(player.Y), float64(item.Y))
-	maxY := math.Max(float64(player.Y), float64(item.Y))
-	return point.X >= int(minX) && point.X <= int(maxX) && point.Y >= int(minY) && point.Y <= int(maxY)
-}
-
-func canSeeItem(playerLoc Loc, itemLoc Loc) bool {
-	wallMutex.Lock()
-	defer wallMutex.Unlock()
-	for x := range GameState.Walls {
-		for y, wall := range GameState.Walls[x] {
-			if wall {
-				log.Printf("Checking wall at (%d,%d) betwen player at (%d,%d) and item at (%d,%d)...",
-					x, y, playerLoc.X, playerLoc.Y, itemLoc.X, itemLoc.Y)
-				if intersects(playerLoc, itemLoc, x, y) {
-					fmt.Println(" Intersects")
-					return true
-				} else {
-					fmt.Println(" Does not Intersect")
-				}
-			}
-		}
-	}
-	return false
-}
+var ammoMutex sync.Mutex
+var foodMutex sync.Mutex
+var shotDelay = 5
 
 func main() {
-
 	host := flag.String("host", "127.0.0.1", "Host")
 	port := flag.Int("port", 11000, "Port")
 	name := flag.String("name", "dvdbot", "Name")
@@ -158,9 +75,106 @@ func main() {
 	log.Printf("Connected to %s\n", conn.RemoteAddr())
 	join(*name, conn)
 
-	go readLoop(conn)
+	go readLoop(conn) // background thread to capture and parse game state messages from server
 	writeLoop(conn)
+}
 
+func setWall(x int, y int) {
+	wallMutex.Lock()
+	defer wallMutex.Unlock()
+	_, ok := GameState.Walls[x]
+	if !ok {
+		GameState.Walls[x] = make(map[int]bool)
+	}
+	GameState.Walls[x][y] = true
+}
+
+func addFood(x int, y int) {
+	foodMutex.Lock()
+	defer foodMutex.Unlock()
+	food := GameState.Food
+	food = append(food, Item{Loc: Loc{X: x, Y: y}, Seen: time.Now()})
+	GameState.Food = food
+}
+
+func addAmmo(x int, y int) {
+	ammoMutex.Lock()
+	defer ammoMutex.Unlock()
+	ammo := GameState.Ammo
+	ammo = append(ammo, Item{Loc: Loc{X: x, Y: y}, Seen: time.Now()})
+	GameState.Ammo = ammo
+}
+
+func intersects(playerLoc Loc, itemLoc Loc, wallX int, wallY int) bool {
+	wallCorner1 := Loc{X: wallX - 4, Y: wallY - 4}
+	wallCorner2 := Loc{X: wallX + 4, Y: wallY + 4}
+
+	a1 := itemLoc.Y - playerLoc.Y
+	b1 := playerLoc.X - itemLoc.X
+	c1 := a1*(playerLoc.X) + b1*playerLoc.Y
+
+	// a1 is always 0, horizontal line
+	b2 := (wallX + 4) - (wallX - 4)
+	c2 := b2 * (wallY - 4)
+
+	determinant := a1 * b2
+
+	if determinant != 0 {
+		x := float64(b2*c1-b1*c2) / float64(determinant)
+		y := float64(a1*c2) / float64(determinant)
+		crossingPoint := Loc{X: int(x), Y: int(y)}
+		// crossing point must be within wall & within player/item bounding box
+		if isWithinBounds(crossingPoint, playerLoc, itemLoc) && isWithinBounds(crossingPoint, wallCorner1, wallCorner2) {
+			//fmt.Printf(" Intersects at (%d,%d)\n", int(x), int(y))
+			return true
+		}
+	}
+
+	a2 := (wallY - 4) - (wallY + 4)
+	// b2 is always 0, vertical line
+	c2 = a2 * (wallX - 4)
+
+	determinant = 0 - a2*b1
+
+	if determinant != 0 {
+		x := float64(0-b1*c2) / float64(determinant)
+		y := float64(a1*c2-a2*c1) / float64(determinant)
+		crossingPoint := Loc{X: int(x), Y: int(y)}
+		// crossing point must be within wall & within player/item bounding box
+		if isWithinBounds(crossingPoint, playerLoc, itemLoc) && isWithinBounds(crossingPoint, wallCorner1, wallCorner2) {
+			//fmt.Printf(" Intersects at (%d,%d)\n", int(x), int(y))
+			return true
+		}
+	}
+
+	return false
+}
+
+func isWithinBounds(point Loc, p1 Loc, p2 Loc) bool {
+	minX := math.Min(float64(p1.X), float64(p2.X))
+	maxX := math.Max(float64(p1.X), float64(p2.X))
+	minY := math.Min(float64(p1.Y), float64(p2.Y))
+	maxY := math.Max(float64(p1.Y), float64(p2.Y))
+	return point.X >= int(minX) && point.X <= int(maxX) && point.Y >= int(minY) && point.Y <= int(maxY)
+}
+
+func canSeeItem(playerLoc Loc, itemLoc Loc) bool {
+	wallMutex.Lock()
+	defer wallMutex.Unlock()
+	for x := range GameState.Walls {
+		for y, wall := range GameState.Walls[x] {
+			if wall {
+				//fmt.Printf("Checking wall at (%d,%d) betwen player at (%d,%d) and item at (%d,%d)...",
+				//	x, y, playerLoc.X, playerLoc.Y, itemLoc.X, itemLoc.Y)
+				if intersects(playerLoc, itemLoc, x, y) {
+					return false
+				} //else {
+				//	fmt.Println(" Does not Intersect")
+				//}
+			}
+		}
+	}
+	return true
 }
 
 func readLoop(conn *net.UDPConn) {
@@ -212,12 +226,10 @@ func readLoop(conn *net.UDPConn) {
 					if GameState.MyKey == nil {
 						GameState.MyKey = &Loc{X: x, Y: y}
 					}
-				}
-			case "nearbyfloors":
-				for i := 0; i < len(msgParams)-1; i += 2 {
-					x, _ := strconv.Atoi(msgParams[i])
-					y, _ := strconv.Atoi(msgParams[i+1])
-					setFloor(x, y)
+				} else if item == "ammo" {
+					addAmmo(x, y)
+				} else if item == "food" {
+					addFood(x, y)
 				}
 			case "nearbyplayer":
 				GameState.SawEnemy = time.Now()
@@ -232,6 +244,7 @@ func readLoop(conn *net.UDPConn) {
 					y, _ := strconv.Atoi(msgParams[i+1])
 					setWall(x, y)
 				}
+			case "nearbyfloors":
 			default:
 				log.Println(msgString)
 			}
@@ -274,7 +287,18 @@ func newDirection(oldDir string, lastLoc Loc, currentLoc Loc) string {
 func writeLoop(conn *net.UDPConn) {
 	dir := "ne"
 	targetItem := "key"
+	shotCount := shotDelay
 	for {
+		if GameState.Player.Ammo == 0 {
+			targetItem = "ammo"
+		} else if GameState.Player.Health < 2 {
+			targetItem = "food"
+		} else if GameState.Player.HasKey {
+			targetItem = "exit"
+		} else {
+			targetItem = "key"
+		}
+		log.Printf("Target: %s\n", targetItem)
 		lastLoc := GameState.Player.Loc
 		switch targetItem {
 		case "key":
@@ -289,21 +313,65 @@ func writeLoop(conn *net.UDPConn) {
 			} else {
 				moveToDir(dir, conn)
 			}
-		}
-		if GameState.Player.HasKey {
-			targetItem = "exit"
+		case "ammo":
+			// This is quite dumb, we should find the nearest ammo we can see and move to it
+			if len(GameState.Ammo) > 0 && canSeeItem(GameState.Player.Loc, GameState.Ammo[0].Loc) {
+				moveTo(GameState.Ammo[0].Loc, conn)
+			} else {
+				moveToDir(dir, conn)
+			}
+		case "food":
+			// This is quite dumb, we should find the nearest food we can see and move to it
+			if len(GameState.Food) > 0 && canSeeItem(GameState.Player.Loc, GameState.Food[0].Loc) {
+				log.Printf("Heading for food at (%d,%d)\n", GameState.Food[0].Loc.X, GameState.Food[0].Loc.Y)
+				moveTo(GameState.Food[0].Loc, conn)
+			} else {
+				moveToDir(dir, conn)
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 		dir = newDirection(dir, lastLoc, GameState.Player.Loc)
-		shoot(conn)
-
+		if shotCount == 0 {
+			shoot(conn)
+			shotCount = shotDelay
+		} else {
+			shotCount--
+		}
+		expireItems()
 	}
+}
+
+func expireItems() {
+	// food and ammo may have been picked up but the game doesn't tell us
+	// delete any items that we haven't seen within the last 5 seconds
+	deadline := time.Now().Add(-5 * time.Second)
+	ammoMutex.Lock()
+	newAmmo := make([]Item, 0)
+	for _, a := range GameState.Ammo {
+		if a.Seen.After(deadline) {
+			// less than 5s since we saw this, keep it
+			newAmmo = append(newAmmo, a)
+		}
+	}
+	GameState.Ammo = newAmmo
+	ammoMutex.Unlock()
+
+	foodMutex.Lock()
+	newFood := make([]Item, 0)
+	for _, f := range GameState.Food {
+		if f.Seen.After(deadline) {
+			// less than 5s since we saw this, keep it
+			newFood = append(newFood, f)
+		}
+	}
+	GameState.Food = newFood
+	foodMutex.Unlock()
 }
 
 func shoot(conn *net.UDPConn) {
 	//directions := []string{"n", "ne", "e", "se", "s", "sw", "w", "nw"}
 	var dir string
-	if GameState.SawEnemy.After(time.Now().Add(-1 * time.Second)) {
+	if GameState.SawEnemy.After(time.Now().Add(-1*time.Second)) && canSeeItem(GameState.Player.Loc, *GameState.Enemy) {
 		//log.Printf("Saw enemy at (%d,%d), player at (%d,%d)\n", GameState.Enemy.X, GameState.Enemy.Y,
 		//	GameState.Player.Loc.X, GameState.Player.Loc.Y)
 		//n := rand.Intn(7)
