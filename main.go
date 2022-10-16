@@ -54,7 +54,7 @@ var GameState = State{
 var wallMutex sync.Mutex
 var ammoMutex sync.Mutex
 var foodMutex sync.Mutex
-var shotDelay = 5
+var shotDelay = 2
 
 func main() {
 	host := flag.String("host", "127.0.0.1", "Host")
@@ -293,10 +293,13 @@ func writeLoop(conn *net.UDPConn) {
 			targetItem = "ammo"
 		} else if GameState.Player.Health < 2 {
 			targetItem = "food"
-		} else if GameState.Player.HasKey {
-			targetItem = "exit"
+			//} else if GameState.Player.HasKey {
+			//	targetItem = "exit"
+			//} else {
+			//	targetItem = "key"
+			//}
 		} else {
-			targetItem = "key"
+			targetItem = "enemy"
 		}
 		log.Printf("Target: %s\n", targetItem)
 		lastLoc := GameState.Player.Loc
@@ -328,8 +331,15 @@ func writeLoop(conn *net.UDPConn) {
 			} else {
 				moveToDir(dir, conn)
 			}
+		case "enemy":
+			if GameState.Enemy != nil && canSeeItem(GameState.Player.Loc, *GameState.Enemy) {
+				log.Printf("Heading for enemy at (%d,%d)\n", GameState.Enemy.X, GameState.Enemy.Y)
+				moveTo(*GameState.Enemy, conn)
+			} else {
+				moveToDir(dir, conn)
+			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		dir = newDirection(dir, lastLoc, GameState.Player.Loc)
 		if shotCount == 0 {
 			shoot(conn)
